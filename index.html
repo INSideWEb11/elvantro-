@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function() {
+        // Intercept and suppress benign Vite HMR websocket disconnection logs in cloud iframe
+        var origConsoleError = console.error;
+        console.error = function() {
+          var args = Array.prototype.slice.call(arguments);
+          if (
+            args.length > 0 &&
+            (
+              (typeof args[0] === 'string' && (args[0].indexOf('[vite]') !== -1 || args[0].indexOf('WebSocket') !== -1)) ||
+              (args[0] && String(args[0]).indexOf('WebSocket closed without opened') !== -1) ||
+              (args[1] && String(args[1]).indexOf('WebSocket closed without opened') !== -1)
+            )
+          ) {
+            return;
+          }
+          origConsoleError.apply(console, args);
+        };
+
+        window.addEventListener('error', function(event) {
+          if (
+            event.message &&
+            (event.message.indexOf('WebSocket') !== -1 || event.message.indexOf('[vite]') !== -1)
+          ) {
+            event.stopImmediatePropagation();
+            event.preventDefault();
+            return true;
+          }
+        }, true);
+
+        window.addEventListener('unhandledrejection', function(event) {
+          if (
+            event.reason &&
+            (String(event.reason).indexOf('WebSocket') !== -1 || String(event.reason).indexOf('[vite]') !== -1)
+          ) {
+            event.stopImmediatePropagation();
+            event.preventDefault();
+            return true;
+          }
+        }, true);
+
+        try {
+          var originalFetch = window.fetch;
+          var currentFetch = originalFetch;
+          Object.defineProperty(window, 'fetch', {
+            get: function() { return currentFetch; },
+            set: function(val) { currentFetch = val; },
+            configurable: true,
+            enumerable: true
+          });
+        } catch (e) {
+          // ignore
+        }
+      })();
+    </script>
+    <title>Elentory - Electronic Parts Inventory ERP</title>
+    <meta name="description" content="Real-time electronic component inventory ERP with AI camera label scanning, live barcode/QR reader, physical grid storage tracking, and automated stock ledgers." />
+    <meta property="og:title" content="Elentory - Electronic Parts Inventory ERP" />
+    <meta property="og:description" content="Real-time electronic component inventory ERP with AI camera label scanning, live barcode/QR reader, physical grid storage tracking, and automated stock ledgers." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#2563eb" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

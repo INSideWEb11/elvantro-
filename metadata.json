@@ -1,0 +1,8 @@
+{
+  "name": "Elentory - Electronic Parts Inventory ERP",
+  "description": "Real-time electronic component inventory ERP with AI camera label scanning, live barcode/QR reader, physical grid storage tracking, and automated stock ledgers.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

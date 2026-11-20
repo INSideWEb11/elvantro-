@@ -993,7 +993,7 @@ export const VendorSupplyChainHub: React.FC<VendorSupplyChainHubProps> = ({
                       </thead>
                       <tbody className="divide-y divide-slate-200">
                         {selectedInvoice.items.map((it, idx) => (
-                          <tr key={it.id || idx} className="hover:bg-slate-50 transition-colors">
+                          <tr key={`${it.id || it.partNumber || 'item'}-${idx}`} className="hover:bg-slate-50 transition-colors">
                             <td className="py-3 px-3 text-center text-slate-500 font-mono tabular-nums">
                               {it.slNo || idx + 1}
                             </td>

@@ -213,10 +213,10 @@ export const ProjectsBOM: React.FC<ProjectsBOMProps> = ({
     }
   };
 
-  // Remove Item from Current Project
-  const handleRemoveItem = async (partNumber: string) => {
+  // Remove Item from Current Project by row index
+  const handleRemoveItem = async (rowIndex: number, partNumber: string) => {
     if (!currentProject) return;
-    const updatedItems = currentProject.items.filter((i) => i.partNumber !== partNumber);
+    const updatedItems = currentProject.items.filter((_, idx) => idx !== rowIndex);
     const updatedProj: ProjectBOM = {
       ...currentProject,
       items: updatedItems,
@@ -231,11 +231,11 @@ export const ProjectsBOM: React.FC<ProjectsBOMProps> = ({
     }
   };
 
-  // Inline Quantity Edit
-  const handleUpdateItemQty = async (partNumber: string, newQty: number) => {
+  // Inline Quantity Edit by row index
+  const handleUpdateItemQty = async (rowIndex: number, newQty: number) => {
     if (!currentProject || newQty <= 0) return;
-    const updatedItems = currentProject.items.map((i) =>
-      i.partNumber === partNumber ? { ...i, requiredQty: newQty } : i
+    const updatedItems = currentProject.items.map((item, idx) =>
+      idx === rowIndex ? { ...item, requiredQty: newQty } : item
     );
     const updatedProj: ProjectBOM = {
       ...currentProject,
@@ -545,8 +545,8 @@ export const ProjectsBOM: React.FC<ProjectsBOMProps> = ({
                         </td>
                       </tr>
                     ) : (
-                      billItemsStatus.map((item) => (
-                        <tr key={item.partNumber} className="hover:bg-slate-50">
+                      billItemsStatus.map((item, idx) => (
+                        <tr key={`${item.partNumber}-${idx}`} className="hover:bg-slate-50">
                           <td className="py-2 px-3 font-bold text-blue-600">{item.partNumber}</td>
                           <td className="py-2 px-3 font-sans text-slate-600 text-[11px] truncate max-w-[150px]">
                             {item.designator ? (
@@ -567,7 +567,7 @@ export const ProjectsBOM: React.FC<ProjectsBOMProps> = ({
                               min={1}
                               value={item.perUnitQty}
                               onChange={(e) =>
-                                handleUpdateItemQty(item.partNumber, parseInt(e.target.value, 10) || 1)
+                                handleUpdateItemQty(idx, parseInt(e.target.value, 10) || 1)
                               }
                               className="w-14 px-1 py-0.5 text-center font-mono font-semibold bg-white border border-slate-300 rounded text-xs"
                               title="Click to edit required quantity per unit"
@@ -595,7 +595,7 @@ export const ProjectsBOM: React.FC<ProjectsBOMProps> = ({
                           <td className="py-2 px-3 text-center">
                             <button
                               type="button"
-                              onClick={() => handleRemoveItem(item.partNumber)}
+                              onClick={() => handleRemoveItem(idx, item.partNumber)}
                               className="p-1 text-slate-400 hover:text-red-600 rounded"
                               title="Remove component from BOM"
                             >

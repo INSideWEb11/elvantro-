@@ -1098,8 +1098,8 @@ export const BulkOperationsHub: React.FC<BulkOperationsHubProps> = ({
               <span>Batch Outward Shortage Detected ({outwardShortages.length} line(s) exceed available stock):</span>
             </div>
             <ul className="list-disc list-inside font-mono text-[11px] space-y-0.5">
-              {outwardShortages.map((s) => (
-                <li key={s.partNumber}>
+              {outwardShortages.map((s, idx) => (
+                <li key={`${s.partNumber}-${idx}`}>
                   <strong className="text-red-900">{s.partNumber}</strong>: Requested {s.requested} pcs, but only {s.available} pcs available in stock.
                 </li>
               ))}

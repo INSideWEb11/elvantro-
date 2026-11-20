@@ -146,6 +146,9 @@ export interface VendorInvoice {
   fileName?: string;
   fileType?: string;
   fileData?: string; // base64 or preview url
+  driveFileId?: string;
+  driveWebViewLink?: string;
+  driveFolderPath?: string;
   items: VendorInvoiceItem[];
   status: 'uploaded' | 'inspected' | 'inwarded';
   createdAt: string;
@@ -154,6 +157,57 @@ export interface VendorInvoice {
   totalItemsCount: number;
   inspectionReportId?: string;
   notes?: string;
+}
+
+// -----------------------------------------------------------------------------
+// APPROVED VENDOR DIRECTORY & VENDOR REGISTRATION
+// -----------------------------------------------------------------------------
+
+export type VendorDocumentCategory =
+  | 'pan_card'
+  | 'gst_certificate'
+  | 'bank_proof'
+  | 'msme_iso_license'
+  | 'vendor_application_form'
+  | 'other';
+
+export interface VendorDocument {
+  id: string;
+  category: VendorDocumentCategory;
+  label: string;
+  fileName: string;
+  mimeType: string;
+  fileSize: number;
+  fileData: string; // base64 data URL (PDF)
+  uploadedAt: string;
+  driveFileId?: string;
+  driveWebViewLink?: string;
+}
+
+export interface ApprovedVendor {
+  id: string;
+  vendorCode: string;
+  name: string;
+  address: string;
+  contactPerson: string;
+  contactDesignation?: string;
+  phone: string;
+  email: string;
+  website?: string;
+  whatSupplierFor: string;
+  suppliedCategories: string[];
+  gstin: string;
+  pan: string;
+  bankName?: string;
+  accountNumber?: string;
+  ifscCode?: string;
+  msmeNumber?: string;
+  isoLicenseNo?: string;
+  status: 'approved' | 'pending_review' | 'suspended';
+  approvedDate: string;
+  notes?: string;
+  documents: VendorDocument[];
+  createdAt: string;
 }
 
 // -----------------------------------------------------------------------------

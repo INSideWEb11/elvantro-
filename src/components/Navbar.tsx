@@ -1,29 +1,38 @@
-import React, { useRef } from 'react';
+import React, { useRef, useState, useEffect, useCallback } from 'react';
 import {
+  Cpu,
   Layers,
   ArrowDownLeft,
   ArrowUpRight,
   Grid,
   FileSpreadsheet,
   History,
-  FolderGit2,
+  FolderKanban,
+  BookOpen,
   Download,
   Upload,
-  BookOpen,
-  Sparkles,
-  Cpu,
-  AlertTriangle,
   RotateCcw,
   Boxes,
   Smartphone,
-  QrCode,
   Menu,
-  Building2,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react';
 import { Part, StockMovement } from '../types/inventory';
 import { formatINR } from '../utils/currency';
+import { GoogleDriveConnectButton } from './GoogleDriveConnectButton';
 
-export type ActiveTab = 'stock' | 'inward' | 'outward' | 'vendor' | 'bulk' | 'grid' | 'report' | 'log' | 'projects' | 'docs';
+export type ActiveTab =
+  | 'stock'
+  | 'inward'
+  | 'outward'
+  | 'bulk'
+  | 'vendor'
+  | 'grid'
+  | 'report'
+  | 'log'
+  | 'projects'
+  | 'docs';
 
 interface NavbarProps {
   activeTab: ActiveTab;
@@ -36,6 +45,7 @@ interface NavbarProps {
   onOpenQuickScan: () => void;
   onOpenAndroidLink?: () => void;
   onToggleSlideBar?: () => void;
+  onShowToast?: (message: string, type?: 'success' | 'error') => void;
   isAndroidPaired?: boolean;
   terminalId?: string;
 }
@@ -49,167 +59,150 @@ export const Navbar: React.FC<NavbarProps> = ({
   onResetData,
   onOpenAndroidLink,
   onToggleSlideBar,
+  onShowToast,
   isAndroidPaired = false,
-  terminalId = 'TRM-8824',
+  terminalId,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const navScrollRef = useRef<HTMLDivElement>(null);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
 
-  // Compute live KPIs
   const totalParts = parts.length;
-  const totalStockUnits = parts.reduce((acc, p) => acc + p.availableStock, 0);
+  const totalUnits = parts.reduce((acc, p) => acc + p.availableStock, 0);
   const totalValuation = parts.reduce((acc, p) => acc + p.totalValue, 0);
   const lowStockCount = parts.filter((p) => p.availableStock <= p.minReorderQty).length;
 
+  // Main ERP navigation tabs (Vendor Portal is cleanly housed inside the Menu drawer)
+  const navItems: { id: ActiveTab; label: string; icon: React.ReactNode; alert?: boolean }[] = [
+    { id: 'stock', label: 'Stock Grid', icon: <Layers className="w-3.5 h-3.5" />, alert: lowStockCount > 0 },
+    { id: 'inward', label: 'Inward', icon: <ArrowDownLeft className="w-3.5 h-3.5" /> },
+    { id: 'outward', label: 'Outward', icon: <ArrowUpRight className="w-3.5 h-3.5" /> },
+    { id: 'bulk', label: 'Bulk Ops', icon: <Boxes className="w-3.5 h-3.5" /> },
+    { id: 'grid', label: 'Storage Map', icon: <Grid className="w-3.5 h-3.5" /> },
+    { id: 'report', label: 'Monthly Report', icon: <FileSpreadsheet className="w-3.5 h-3.5" /> },
+    { id: 'log', label: 'Audit Log', icon: <History className="w-3.5 h-3.5" /> },
+    { id: 'projects', label: 'Project BOMs', icon: <FolderKanban className="w-3.5 h-3.5" /> },
+    { id: 'docs', label: 'Docs & SOP', icon: <BookOpen className="w-3.5 h-3.5" /> },
+  ];
+
+  const updateScrollButtons = useCallback(() => {
+    const el = navScrollRef.current;
+    if (!el) return;
+    setCanScrollLeft(el.scrollLeft > 4);
+    setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 4);
+  }, []);
+
+  useEffect(() => {
+    updateScrollButtons();
+    window.addEventListener('resize', updateScrollButtons);
+    return () => window.removeEventListener('resize', updateScrollButtons);
+  }, [updateScrollButtons]);
+
+  const scrollNavBy = (delta: number) => {
+    const el = navScrollRef.current;
+    if (!el) return;
+    el.scrollBy({ left: delta, behavior: 'smooth' });
+  };
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      onImportJson(e.target.files[0]);
-      if (fileInputRef.current) fileInputRef.current.value = '';
+    const file = e.target.files?.[0];
+    if (file) {
+      onImportJson(file);
+      e.target.value = '';
     }
   };
 
-  const navItems = [
-    { id: 'stock' as ActiveTab, label: 'Stock Grid', icon: Layers },
-    { id: 'inward' as ActiveTab, label: 'Inward Intake', icon: ArrowDownLeft, badge: 'AI' },
-    { id: 'outward' as ActiveTab, label: 'Outward Dispatch', icon: ArrowUpRight, badge: 'AI' },
-    { id: 'vendor' as ActiveTab, label: 'Vendor Hub & SIR', icon: Building2, badge: 'NEW' },
-    { id: 'bulk' as ActiveTab, label: 'Bulk Ops & WiFi', icon: Boxes, badge: 'BATCH' },
-    { id: 'grid' as ActiveTab, label: 'Storage Matrix', icon: Grid },
-    { id: 'report' as ActiveTab, label: 'Monthly Report', icon: FileSpreadsheet },
-    { id: 'log' as ActiveTab, label: 'Audit Log', icon: History },
-    { id: 'projects' as ActiveTab, label: 'Project BOMs', icon: FolderGit2, badge: 'IMPORT' },
-    { id: 'docs' as ActiveTab, label: 'Docs & SOP', icon: BookOpen },
-  ];
-
   return (
-    <header className="bg-white border-b border-slate-200 sticky top-0 z-30">
-      {/* Top Banner & KPI Bar */}
+    <header className="sticky top-0 z-30 bg-white border-b border-slate-200">
+      {/* Row 1: Brand, Live Inventory Metrics & Utility Controls */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between h-16 gap-2 sm:gap-4">
-          {/* Menu Hamburger & Logo */}
-          <div className="flex items-center space-x-2 sm:space-x-3 shrink-0">
+        <div className="flex items-center justify-between h-14 gap-3">
+          {/* Left: Menu Drawer Trigger + Brand */}
+          <div className="flex items-center space-x-2.5 min-w-0">
             {onToggleSlideBar && (
               <button
                 type="button"
                 onClick={onToggleSlideBar}
-                className="p-2 text-slate-700 hover:text-blue-600 hover:bg-blue-50 active:bg-blue-100 rounded-xl border border-slate-200 flex items-center space-x-1.5 transition-all shadow-xs group shrink-0"
-                title="Open Navigation Menu"
+                className="inline-flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-100 border border-slate-300 text-slate-800 transition-colors shrink-0"
+                title="Open Navigation Menu & Vendor Portal"
               >
-                <Menu className="w-5 h-5 text-slate-700 group-hover:text-blue-600 transition-colors" />
-                <span className="text-xs font-bold hidden sm:inline text-slate-800 group-hover:text-blue-700">
-                  Menu
-                </span>
+                <Menu className="w-4 h-4 text-slate-700" />
+                <span className="text-xs font-semibold">Menu</span>
               </button>
             )}
 
-            <div className="flex items-center space-x-2.5 sm:space-x-3 shrink-0">
-              <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow-sm shrink-0">
-                <Cpu className="w-5 h-5 sm:w-6 sm:h-6" />
+            <button
+              type="button"
+              onClick={() => setActiveTab('stock')}
+              className="flex items-center space-x-2.5 text-left min-w-0"
+            >
+              <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-blue-600 text-white shrink-0">
+                <Cpu className="w-4 h-4" />
               </div>
-              <div className="shrink-0">
-                <div className="flex items-center space-x-1.5 sm:space-x-2">
-                  <span className="font-bold text-base sm:text-lg text-slate-900 tracking-tight">ELENTORY</span>
-                  <span className="text-[10px] sm:text-xs px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 font-mono font-medium border border-blue-200">
-                    ERP v1.4
+              <div className="min-w-0">
+                <div className="flex items-center space-x-1.5">
+                  <span className="text-sm font-bold tracking-tight text-slate-900">ELENTORY</span>
+                  <span className="hidden sm:inline font-mono text-[10px] font-semibold text-slate-500">
+                    ERP
                   </span>
                 </div>
-                <p className="text-[10px] sm:text-xs text-slate-500 hidden sm:block">Electronic Parts & Storage Ledger</p>
+                <p className="hidden md:block text-[11px] text-slate-500 leading-tight truncate">
+                  Electronic Parts & Storage Ledger
+                </p>
               </div>
-            </div>
+            </button>
           </div>
 
-          {/* Real-time KPI summary bar - Full on XL, Compact Pill on MD-LG */}
-          <div className="hidden xl:flex items-center space-x-6 text-sm border-l border-r border-slate-200 px-6 shrink-0">
-            <div>
-              <span className="text-[11px] text-slate-500 block uppercase font-medium">Catalog SKUs</span>
-              <span className="font-mono tabular-nums font-semibold text-slate-800">{totalParts} parts</span>
-            </div>
-            <div>
-              <span className="text-[11px] text-slate-500 block uppercase font-medium">Total On-Hand</span>
-              <span className="font-mono tabular-nums font-semibold text-slate-800">
-                {totalStockUnits.toLocaleString()} units
-              </span>
-            </div>
-            <div>
-              <span className="text-[11px] text-slate-500 block uppercase font-medium">Warehouse Value</span>
-              <span className="font-mono tabular-nums font-semibold text-emerald-600">
-                {formatINR(totalValuation)}
-              </span>
-            </div>
+          {/* Center: Compact Live Ledger Metrics */}
+          <div className="hidden xl:flex items-center space-x-3 text-xs font-mono tabular-nums text-slate-600 px-3 py-1 rounded-lg bg-slate-50 border border-slate-200 shrink-0">
+            <span className="font-semibold text-slate-900">{totalParts} SKUs</span>
+            <span className="text-slate-300">·</span>
+            <span>{totalUnits.toLocaleString()} pcs</span>
+            <span className="text-slate-300">·</span>
+            <span className="font-semibold text-emerald-700">{formatINR(totalValuation)}</span>
             {lowStockCount > 0 && (
-              <div
-                onClick={() => setActiveTab('stock')}
-                className="cursor-pointer bg-amber-50 border border-amber-200 rounded px-2.5 py-1 flex items-center space-x-1.5 text-amber-800 hover:bg-amber-100 transition-colors"
-                title="Click to view low-stock items in Stock Grid"
-              >
-                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                <span className="font-mono tabular-nums font-semibold text-xs">{lowStockCount} Low</span>
-              </div>
+              <>
+                <span className="text-slate-300">·</span>
+                <span className="font-semibold text-amber-700">{lowStockCount} Low</span>
+              </>
             )}
           </div>
 
-          {/* Compact KPI Badge on Medium screens to prevent overflow */}
-          <div className="hidden md:flex xl:hidden items-center space-x-2 text-xs bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-lg shrink-0">
-            <span className="font-semibold text-slate-700">{totalParts} SKUs</span>
-            <span className="text-slate-300">·</span>
-            <span className="font-mono text-slate-600">{totalStockUnits.toLocaleString()} pcs</span>
-            <span className="text-slate-300">·</span>
-            <span className="font-mono font-semibold text-emerald-600">
-              {formatINR(totalValuation)}
-            </span>
-            {lowStockCount > 0 && (
-              <span
-                onClick={() => setActiveTab('stock')}
-                className="cursor-pointer ml-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-bold hover:bg-amber-200 transition-colors"
-                title={`${lowStockCount} items below threshold`}
-              >
-                {lowStockCount} Low
-              </span>
-            )}
-          </div>
+          {/* Right: Google Drive, Android & Backup Actions */}
+          <div className="flex items-center space-x-1.5 shrink-0">
+            <GoogleDriveConnectButton compact onStatusMessage={onShowToast} />
 
-          {/* Quick Actions (Android App Link, Backup, Restore, Reset) */}
-          <div className="flex items-center space-x-1.5 sm:space-x-2 shrink-0">
             {onOpenAndroidLink && (
               <button
                 type="button"
                 onClick={onOpenAndroidLink}
-                className={`inline-flex items-center space-x-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-semibold rounded-lg transition-all shadow-xs border shrink-0 ${
+                className={`inline-flex items-center space-x-1.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
                   isAndroidPaired
-                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300 hover:bg-emerald-100'
-                    : 'bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white border-blue-500'
+                    ? 'text-emerald-800 bg-emerald-50 border-emerald-200 hover:bg-emerald-100'
+                    : 'text-slate-700 bg-white border-slate-300 hover:bg-slate-50'
                 }`}
-                title="Connect Android Phone or Mobile Scanner via QR Code"
+                title={
+                  isAndroidPaired
+                    ? `Paired to Android Mobile Terminal (${terminalId})`
+                    : 'Pair Android Phone Camera Scanner'
+                }
               >
-                <Smartphone className="w-3.5 h-3.5 shrink-0" />
-                <span className="hidden lg:inline">
-                  {isAndroidPaired ? 'Android Linked' : 'Link Android App'}
-                </span>
-                <span className="lg:hidden text-[11px]">Android</span>
-                <span
-                  className={`w-2 h-2 rounded-full shrink-0 ${
-                    isAndroidPaired ? 'bg-emerald-500 animate-ping' : 'bg-emerald-300'
-                  }`}
-                />
+                <Smartphone className="w-3.5 h-3.5" />
+                <span className="hidden md:inline">{isAndroidPaired ? 'Paired' : 'Android'}</span>
               </button>
             )}
 
             <button
+              type="button"
               onClick={onExportJson}
-              className="inline-flex items-center space-x-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-300 rounded-lg hover:bg-slate-100 transition-colors shrink-0"
-              title="Export complete database backup as JSON"
+              className="hidden sm:inline-flex items-center space-x-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors shrink-0"
+              title="Export Full Database Backup (JSON)"
             >
-              <Download className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-              <span className="hidden md:inline">Backup</span>
+              <Download className="w-3.5 h-3.5 text-slate-500" />
+              <span className="hidden lg:inline">Backup</span>
             </button>
 
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="inline-flex items-center space-x-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-300 rounded-lg hover:bg-slate-100 transition-colors shrink-0"
-              title="Import and restore database from JSON file"
-            >
-              <Upload className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-              <span className="hidden md:inline">Import</span>
-            </button>
             <input
               ref={fileInputRef}
               type="file"
@@ -217,104 +210,86 @@ export const Navbar: React.FC<NavbarProps> = ({
               onChange={handleFileChange}
               className="hidden"
             />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="hidden sm:inline-flex items-center space-x-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors shrink-0"
+              title="Restore Database from JSON Backup"
+            >
+              <Upload className="w-3.5 h-3.5 text-slate-500" />
+              <span className="hidden lg:inline">Import</span>
+            </button>
 
             <button
+              type="button"
               onClick={onResetData}
-              className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg border border-transparent hover:border-slate-200 transition-colors shrink-0"
-              title="Reset to factory test lab inventory dataset"
+              className="p-1.5 text-slate-400 hover:text-amber-600 rounded-lg hover:bg-slate-100 transition-colors shrink-0"
+              title="Reset to Factory Test Lab Dataset"
             >
-              <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+              <RotateCcw className="w-3.5 h-3.5" />
             </button>
           </div>
         </div>
       </div>
 
-      {/* Main Tab Navigation Bar */}
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 border-t border-slate-100">
-        <nav className="flex space-x-1 sm:space-x-2 overflow-x-auto py-2 no-scrollbar scroll-smooth items-center">
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            const isActive = activeTab === item.id;
-            return (
-              <button
-                key={item.id}
-                onClick={() => setActiveTab(item.id)}
-                className={`flex items-center space-x-1.5 sm:space-x-2 px-3 py-1.5 sm:py-2 text-xs sm:text-sm font-medium rounded-lg whitespace-nowrap transition-colors shrink-0 ${
-                  isActive
-                    ? 'bg-blue-50 text-blue-700 font-semibold border border-blue-200'
-                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100 border border-transparent'
-                }`}
-              >
-                <Icon className={`w-4 h-4 shrink-0 ${isActive ? 'text-blue-600' : 'text-slate-400'}`} />
-                <span>{item.label}</span>
-                {item.badge && (
-                  <span className="text-[10px] uppercase font-mono font-bold bg-blue-600 text-white px-1.5 py-0.2 rounded">
-                    {item.badge}
-                  </span>
-                )}
-                {item.id === 'stock' && lowStockCount > 0 && (
-                  <span className="w-2 h-2 rounded-full bg-amber-500 shrink-0" title={`${lowStockCount} items below threshold`} />
-                )}
-              </button>
-            );
-          })}
-        </nav>
-      </div>
+      {/* Row 2: Clean Full-Width Main Navigation Bar (No Clipped Tabs) */}
+      <div className="border-t border-slate-200 bg-slate-50/70">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 relative flex items-center">
+          {canScrollLeft && (
+            <button
+              type="button"
+              onClick={() => scrollNavBy(-220)}
+              aria-label="Scroll navigation left"
+              className="absolute left-1 z-10 flex items-center justify-center w-7 h-7 rounded-md bg-white border border-slate-300 text-slate-700 shadow-xs hover:bg-slate-50"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+          )}
 
-      {/* Quick Feature Spotlight Bar */}
-      <div className="bg-gradient-to-r from-blue-50/70 via-indigo-50/50 to-slate-50 border-t border-slate-200/80 px-4 sm:px-6 lg:px-8 py-1.5 text-xs text-slate-700 flex flex-wrap items-center justify-between gap-2 overflow-hidden">
-        <div className="flex items-center space-x-2 min-w-0">
-          <Sparkles className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-          <span className="font-semibold text-slate-800 text-[11px] shrink-0">Quick Shortcuts:</span>
-          <span className="text-slate-500 text-[11px] truncate hidden md:inline">
-            Vendor Invoice Intake · DOCX Inspection Reports · Android Companion Sync · Storage Matrix
-          </span>
-        </div>
-        <div className="flex items-center space-x-1.5 font-mono text-[11px] shrink-0 overflow-x-auto no-scrollbar">
-          <button
-            type="button"
-            onClick={() => setActiveTab('vendor')}
-            className={`px-2 py-0.5 rounded font-bold transition-all shrink-0 ${
-              activeTab === 'vendor'
-                ? 'bg-blue-600 text-white'
-                : 'bg-white text-blue-700 border border-blue-200 hover:bg-blue-50'
-            }`}
+          <nav
+            ref={navScrollRef}
+            onScroll={updateScrollButtons}
+            className="flex items-center space-x-1 overflow-x-auto no-scrollbar w-full py-1.5"
+            aria-label="Primary Inventory Navigation"
           >
-            🏢 Vendor Hub & SIR →
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('inward')}
-            className={`px-2 py-0.5 rounded font-bold transition-all shrink-0 ${
-              activeTab === 'inward'
-                ? 'bg-emerald-600 text-white'
-                : 'bg-white text-emerald-700 border border-emerald-200 hover:bg-emerald-50'
-            }`}
-          >
-            📥 Inward Scanner →
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('outward')}
-            className={`px-2 py-0.5 rounded font-bold transition-all shrink-0 ${
-              activeTab === 'outward'
-                ? 'bg-blue-600 text-white'
-                : 'bg-white text-blue-700 border border-blue-200 hover:bg-blue-50'
-            }`}
-          >
-            📷 Outward Dispatch →
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('bulk')}
-            className={`px-2 py-0.5 rounded font-bold transition-all shrink-0 ${
-              activeTab === 'bulk'
-                ? 'bg-purple-600 text-white'
-                : 'bg-white text-purple-700 border border-purple-200 hover:bg-purple-50'
-            }`}
-          >
-            ⚡ Bulk & Gun →
-          </button>
+            {navItems.map((item) => {
+              const isActive = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setActiveTab(item.id)}
+                  className={`inline-flex items-center space-x-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 transition-colors ${
+                    isActive
+                      ? 'bg-blue-600 text-white font-semibold'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/70'
+                  }`}
+                >
+                  <span className={isActive ? 'text-white' : 'text-slate-400'}>{item.icon}</span>
+                  <span>{item.label}</span>
+                  {item.alert && (
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        isActive ? 'bg-amber-300' : 'bg-amber-500'
+                      }`}
+                      title={`${lowStockCount} low stock parts`}
+                    />
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+
+          {canScrollRight && (
+            <button
+              type="button"
+              onClick={() => scrollNavBy(220)}
+              aria-label="Scroll navigation right"
+              className="absolute right-1 z-10 flex items-center justify-center w-7 h-7 rounded-md bg-white border border-slate-300 text-slate-700 shadow-xs hover:bg-slate-50"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          )}
         </div>
       </div>
     </header>

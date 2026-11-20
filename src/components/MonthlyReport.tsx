@@ -5,26 +5,76 @@ import {
   ChevronDown,
   ChevronRight,
   TrendingUp,
-  TrendingDown,
   Calendar,
-  Layers,
   ArrowDownLeft,
   ArrowUpRight,
   Boxes,
   PieChart,
+  HardDrive,
+  RefreshCw,
+  ExternalLink,
   CheckCircle2,
 } from 'lucide-react';
-import { StockMovement, Part, MonthlyRollup } from '../types/inventory';
+import { StockMovement, Part, MonthlyRollup, VendorInvoice } from '../types/inventory';
 import { inventoryApi } from '../services/api';
 import { formatINR } from '../utils/currency';
+import { useGoogleDrive } from '../context/GoogleDriveContext';
 
 interface MonthlyReportProps {
   movements: StockMovement[];
   parts: Part[];
+  vendorInvoices?: VendorInvoice[];
+  onShowToast?: (message: string, type?: 'success' | 'error') => void;
 }
 
-export const MonthlyReport: React.FC<MonthlyReportProps> = ({ movements, parts }) => {
+export const MonthlyReport: React.FC<MonthlyReportProps> = ({
+  movements,
+  parts,
+  vendorInvoices = [],
+  onShowToast,
+}) => {
+  const { uploadWithOverwriteGuard } = useGoogleDrive();
   const [expandedMonth, setExpandedMonth] = useState<string | null>(null);
+  const [isExportingDrive, setIsExportingDrive] = useState(false);
+  const [lastDriveExport, setLastDriveExport] = useState<{
+    fileName: string;
+    folderPath: string;
+    webViewLink: string;
+  } | null>(null);
+
+  const handleExportInwardToDrive = async (monthKey?: string) => {
+    try {
+      setIsExportingDrive(true);
+      const { blob, fileName } = inventoryApi.buildInwardReportExcelBlob(
+        movements,
+        parts,
+        vendorInvoices,
+        monthKey
+      );
+      const result = await uploadWithOverwriteGuard({
+        blob,
+        fileName,
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        folderSegments: ['Elentory ERP', 'Inward'],
+        promptSignIn: true,
+      });
+
+      if (!result) return; // cancelled by user
+      setLastDriveExport({
+        fileName: result.fileName,
+        folderPath: result.folderPath,
+        webViewLink: result.webViewLink,
+      });
+      onShowToast?.(
+        `Exported "${result.fileName}" to Google Drive (${result.folderPath})`,
+        'success'
+      );
+    } catch (err: any) {
+      onShowToast?.(err?.message || 'Failed to export Inward Report to Google Drive', 'error');
+    } finally {
+      setIsExportingDrive(false);
+    }
+  };
 
   // Current On-Hand Inventory Metrics
   const totalCurrentStockUnits = useMemo(
@@ -151,6 +201,22 @@ export const MonthlyReport: React.FC<MonthlyReportProps> = ({ movements, parts }
         {/* Export Buttons */}
         <div className="flex flex-wrap items-center gap-2">
           <button
+            type="button"
+            disabled={isExportingDrive}
+            onClick={() => handleExportInwardToDrive()}
+            className="inline-flex items-center space-x-1.5 px-3 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-md shadow-xs transition-colors disabled:opacity-50"
+            title="Upload complete Inward Report (.xlsx) directly to Google Drive inside Elentory ERP / Inward folder"
+          >
+            {isExportingDrive ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <HardDrive className="w-3.5 h-3.5" />
+            )}
+            <span>{isExportingDrive ? 'Uploading to Drive...' : 'Export Inward Report to Google Drive'}</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => inventoryApi.exportMonthlyExcel(rollups, parts, movements)}
             className="inline-flex items-center space-x-1.5 px-3 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-md shadow-xs transition-colors"
             title="Download multi-sheet financial accounting workbook (.xlsx) with complete closing inventory"
@@ -160,6 +226,7 @@ export const MonthlyReport: React.FC<MonthlyReportProps> = ({ movements, parts }
           </button>
 
           <button
+            type="button"
             onClick={() => inventoryApi.exportMonthlyCsv(movements)}
             className="inline-flex items-center space-x-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors"
             title="Download Monthly Rollup formatted for spreadsheet accounting (CSV)"
@@ -169,6 +236,28 @@ export const MonthlyReport: React.FC<MonthlyReportProps> = ({ movements, parts }
           </button>
         </div>
       </div>
+
+      {/* Google Drive Export Confirmation Banner */}
+      {lastDriveExport && (
+        <div className="px-4 py-3 rounded-lg bg-emerald-50 border border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+          <div className="flex items-center space-x-2 text-emerald-900">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>
+              Inward Report <strong>{lastDriveExport.fileName}</strong> saved in Google Drive folder{' '}
+              <span className="font-mono font-semibold">{lastDriveExport.folderPath}</span>
+            </span>
+          </div>
+          <a
+            href={lastDriveExport.webViewLink}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center space-x-1 font-semibold text-blue-700 hover:underline shrink-0"
+          >
+            <span>Open in Google Drive</span>
+            <ExternalLink className="w-3.5 h-3.5" />
+          </a>
+        </div>
+      )}
 
       {/* Primary KPI Cards (Highlighting Complete Remaining Inventory Cost!) */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

@@ -363,13 +363,23 @@ export function buildInspectionReportDocx(report: SupplierInspectionReport): Doc
 }
 
 /**
- * Triggers a browser download of the Supplier Inspection Report in .docx Microsoft Word format.
+ * Generates a .docx Blob and sanitized filename for downloading or uploading to Google Drive.
  */
-export async function downloadInspectionReportDocx(report: SupplierInspectionReport): Promise<void> {
+export async function buildInspectionReportDocxBlob(
+  report: SupplierInspectionReport
+): Promise<{ blob: Blob; fileName: string }> {
   const doc = buildInspectionReportDocx(report);
   const blob = await Packer.toBlob(doc);
   const cleanNum = (report.reportNumber || 'SIR').replace(/[\/\\?%*:|"<>]/g, '_');
   const fileName = `Supplier_Inspection_Report_${cleanNum}.docx`;
+  return { blob, fileName };
+}
+
+/**
+ * Triggers a browser download of the Supplier Inspection Report in .docx Microsoft Word format.
+ */
+export async function downloadInspectionReportDocx(report: SupplierInspectionReport): Promise<void> {
+  const { blob, fileName } = await buildInspectionReportDocxBlob(report);
 
   const link = document.createElement('a');
   link.href = URL.createObjectURL(blob);

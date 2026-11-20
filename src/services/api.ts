@@ -8,6 +8,7 @@ import {
   OutwardScanResult,
   VendorInvoice,
   SupplierInspectionReport,
+  ApprovedVendor,
 } from '../types/inventory';
 import {
   INITIAL_PARTS,
@@ -15,6 +16,7 @@ import {
   INITIAL_PROJECTS,
   INITIAL_VENDOR_INVOICES,
   INITIAL_INSPECTION_REPORTS,
+  INITIAL_APPROVED_VENDORS,
   generateLocations,
 } from '../data/seedData';
 import * as XLSX from 'xlsx';
@@ -29,6 +31,7 @@ interface CachedState {
   locations: StorageLocation[];
   vendorInvoices: VendorInvoice[];
   inspectionReports: SupplierInspectionReport[];
+  approvedVendors: ApprovedVendor[];
 }
 
 // Load cached state or default seed data
@@ -42,6 +45,7 @@ const getInitialState = (): CachedState => {
           ...parsed,
           vendorInvoices: parsed.vendorInvoices || INITIAL_VENDOR_INVOICES,
           inspectionReports: parsed.inspectionReports || INITIAL_INSPECTION_REPORTS,
+          approvedVendors: parsed.approvedVendors || INITIAL_APPROVED_VENDORS,
         };
       }
     }
@@ -55,6 +59,7 @@ const getInitialState = (): CachedState => {
     locations: generateLocations(),
     vendorInvoices: INITIAL_VENDOR_INVOICES,
     inspectionReports: INITIAL_INSPECTION_REPORTS,
+    approvedVendors: INITIAL_APPROVED_VENDORS,
   };
 };
 
@@ -208,40 +213,17 @@ export const inventoryApi = {
 
   // Scan component label with Gemini Vision / OCR
   async scanLabel(imageBase64: string, mimeType = 'image/jpeg', fileName?: string): Promise<AIScanResult> {
-    try {
-      const res = await fetch('/api/scan-label', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imageBase64, mimeType, fileName }),
-      });
-      if (res.ok) {
-        const body = await res.json();
-        return body.data;
-      }
-    } catch {
-      // API scan fallback to client parser
+    const res = await fetch('/api/scan-label', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64, mimeType, fileName }),
+    });
+    if (res.ok) {
+      const body = await res.json();
+      return body.data;
     }
-
-    // Default simulated smart scan if server unreachable, with unique part identifier based on fileName
-    const tag = fileName ? fileName.replace(/\.[^/.]+$/, '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(-6) : '';
-    return {
-      partNumber: tag ? `RC0805-${tag}` : 'RC0805FR-0710KL',
-      category: 'Resistor',
-      makeBrand: 'Yageo',
-      supplier: 'DigiKey',
-      quantity: 1000,
-      unitPrice: 0.35,
-      technicalSpecs: {
-        value: '10kΩ',
-        tolerance: '±1%',
-        packageFootprint: '0805',
-        powerOrVoltageRating: '1/8W',
-        dielectricOrType: 'Thick Film',
-      },
-      suggestedLocation: 'STR1S1B1',
-      rawOcrText: `DIGIKEY PART: RC0805 | QTY: 1000 | RES SMD 10K OHM 1% 1/8W 0805 | ${fileName || 'Reel Photo'}`,
-      confidence: 'medium',
-    };
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error(errBody.error || `Label OCR scan failed (HTTP ${res.status})`);
   },
 
   // Alias for scanLabel with wrapped data
@@ -252,57 +234,17 @@ export const inventoryApi = {
 
   // Scan component reel or work order sheet during outward dispatch
   async scanOutward(imageBase64: string, mimeType = 'image/jpeg'): Promise<OutwardScanResult> {
-    try {
-      const res = await fetch('/api/scan-outward', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imageBase64, mimeType }),
-      });
-      if (res.ok) {
-        const body = await res.json();
-        return body.data;
-      }
-    } catch {
-      // Backend outward scan fallback
-    }
-
-    // Local fallback correlation
-    const current = getInitialState();
-    const demoItems = [
-      { partNumber: 'CRCW06031K00FKEA', quantity: 150 },
-      { partNumber: 'CL21B104KBCNNNC', quantity: 200 },
-      { partNumber: '1N4148W-7-F', quantity: 50 },
-    ];
-
-    const enriched = demoItems.map((item) => {
-      const part = current.parts.find((p) => p.partNumber === item.partNumber);
-      if (!part) {
-        return {
-          partNumber: item.partNumber,
-          quantity: item.quantity,
-          availableStock: 0,
-          location: 'N/A',
-          unitPrice: 0,
-          status: 'not_found' as const,
-        };
-      }
-      return {
-        partNumber: part.partNumber,
-        quantity: item.quantity,
-        notes: part.description,
-        availableStock: part.availableStock,
-        location: part.location,
-        unitPrice: part.avgUnitPrice,
-        status: (item.quantity > part.availableStock ? 'shortage' : 'ok') as 'ok' | 'shortage',
-      };
+    const res = await fetch('/api/scan-outward', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64, mimeType }),
     });
-
-    return {
-      scanMode: 'work_order',
-      workOrderNumber: 'WO-8821',
-      items: enriched,
-      rawOcrText: 'WORK ORDER WO-8821 | SMT PILOT RUN | REQ: CRCW06031K00FKEA x150, CL21B104KBCNNNC x200, 1N4148W-7-F x50',
-    };
+    if (res.ok) {
+      const body = await res.json();
+      return body.data;
+    }
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error(errBody.error || `Outward scan failed (HTTP ${res.status})`);
   },
 
   // Save / Update Project BOM
@@ -803,6 +745,7 @@ export const inventoryApi = {
       locations: generateLocations(),
       vendorInvoices: INITIAL_VENDOR_INVOICES,
       inspectionReports: INITIAL_INSPECTION_REPORTS,
+      approvedVendors: INITIAL_APPROVED_VENDORS,
     };
     saveCachedState(reset);
   },
@@ -1215,58 +1158,22 @@ export const inventoryApi = {
   },
 
   async scanVendorInvoice(imageBase64: string, mimeType?: string, fileName?: string): Promise<{ success: boolean; invoice: VendorInvoice; message?: string }> {
-    try {
-      const res = await fetch('/api/vendor/invoices/scan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imageBase64, mimeType, fileName }),
-      });
-      if (res.ok) {
-        return await res.json();
+    const res = await fetch('/api/vendor/invoices/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64, mimeType, fileName }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.invoice) {
+        const current = getInitialState();
+        current.vendorInvoices = [data.invoice, ...current.vendorInvoices.filter((i) => i.id !== data.invoice.id)];
+        saveCachedState(current);
       }
-      const err = await res.json();
-      throw new Error(err.error || 'Failed to scan vendor invoice');
-    } catch (e: any) {
-      // Offline fallback invoice simulation
-      const fallbackInvoice: VendorInvoice = {
-        id: `vinv-${Date.now()}`,
-        supplier: 'Mudra Innovation',
-        supplierGstin: '29ABHFM7009H1Z2',
-        customer: 'SENSEL TELEMATICS PVT LTD',
-        invoiceNumber: `INV-KT/25-26/${Math.floor(800 + Math.random() * 100)}`,
-        invoiceDate: new Date().toISOString().split('T')[0],
-        purchaseOrder: 'STPL-PO-2025-26-S171',
-        ewayBill: '122380664709',
-        fileName: fileName || 'uploaded_invoice.pdf',
-        fileType: mimeType || 'application/pdf',
-        fileData: imageBase64,
-        status: 'uploaded',
-        createdAt: new Date().toISOString(),
-        totalAmount: 2655,
-        totalItemsCount: 590,
-        notes: 'Simulated from offline supplier invoice OCR fallback',
-        items: [
-          {
-            id: `vitem-${Date.now()}-1`,
-            slNo: 1,
-            partNumber: 'ENC-ABS-ASG-GOLD',
-            description: 'ABS Enclosures (ASG Gold Enclosures)',
-            hsn: '39269099',
-            quantity: 590,
-            unitPrice: 4.5,
-            totalPrice: 2655,
-            category: 'Enclosure',
-            location: 'STR1S3B1',
-            notes: 'ABS plastic injection moulding enclosure batch',
-            isNewSku: true,
-          },
-        ],
-      };
-      const current = getInitialState();
-      current.vendorInvoices.unshift(fallbackInvoice);
-      saveCachedState(current);
-      return { success: true, invoice: fallbackInvoice, message: 'Processed with local OCR template' };
+      return data;
     }
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Failed to scan vendor invoice (HTTP ${res.status})`);
   },
 
   async inwardVendorInvoice(invoiceId: string, allocatedLocations?: Record<string, string>): Promise<{ success: boolean; message: string; invoice: VendorInvoice }> {
@@ -1386,5 +1293,187 @@ export const inventoryApi = {
     const current = getInitialState();
     current.inspectionReports = current.inspectionReports.filter((r) => r.id !== id);
     saveCachedState(current);
+  },
+
+  // ---------------------------------------------------------------------------
+  // APPROVED VENDORS DIRECTORY & REGISTRATION
+  // ---------------------------------------------------------------------------
+  async getApprovedVendors(): Promise<ApprovedVendor[]> {
+    try {
+      const res = await fetch('/api/vendors');
+      if (res.ok) {
+        const data = await res.json();
+        return data.vendors || [];
+      }
+    } catch {
+      // Fallback
+    }
+    return getInitialState().approvedVendors || [];
+  },
+
+  async saveApprovedVendor(vendor: Partial<ApprovedVendor>): Promise<ApprovedVendor> {
+    try {
+      const res = await fetch('/api/vendors', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(vendor),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.vendor) {
+          const current = getInitialState();
+          const idx = current.approvedVendors.findIndex((v) => v.id === data.vendor.id);
+          if (idx >= 0) current.approvedVendors[idx] = data.vendor;
+          else current.approvedVendors.push(data.vendor);
+          saveCachedState(current);
+          return data.vendor;
+        }
+      }
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to save vendor');
+    } catch (e: any) {
+      if (e?.message && e.message.includes('Vendor name is required')) throw e;
+      const current = getInitialState();
+      const now = new Date().toISOString();
+      const saved: ApprovedVendor = {
+        id: vendor.id || `vnd-${Date.now()}`,
+        vendorCode:
+          vendor.vendorCode ||
+          `VND-${String(current.approvedVendors.length + 1).padStart(3, '0')}`,
+        name: vendor.name || 'Unnamed Vendor',
+        address: vendor.address || '',
+        contactPerson: vendor.contactPerson || '',
+        contactDesignation: vendor.contactDesignation || '',
+        phone: vendor.phone || '',
+        email: vendor.email || '',
+        website: vendor.website || '',
+        whatSupplierFor: vendor.whatSupplierFor || '',
+        suppliedCategories: vendor.suppliedCategories || [],
+        gstin: (vendor.gstin || '').toUpperCase(),
+        pan: (vendor.pan || '').toUpperCase(),
+        bankName: vendor.bankName || '',
+        accountNumber: vendor.accountNumber || '',
+        ifscCode: (vendor.ifscCode || '').toUpperCase(),
+        msmeNumber: (vendor.msmeNumber || '').toUpperCase(),
+        isoLicenseNo: vendor.isoLicenseNo || '',
+        status: vendor.status || 'approved',
+        approvedDate: vendor.approvedDate || now.slice(0, 10),
+        notes: vendor.notes || '',
+        documents: vendor.documents || [],
+        createdAt: vendor.createdAt || now,
+      };
+      const idx = current.approvedVendors.findIndex((v) => v.id === saved.id);
+      if (idx >= 0) current.approvedVendors[idx] = saved;
+      else current.approvedVendors.push(saved);
+      saveCachedState(current);
+      return saved;
+    }
+  },
+
+  async deleteApprovedVendor(id: string): Promise<void> {
+    try {
+      await fetch(`/api/vendors/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    } catch {
+      // Fallback
+    }
+    const current = getInitialState();
+    current.approvedVendors = current.approvedVendors.filter((v) => v.id !== id);
+    saveCachedState(current);
+  },
+
+  // Build an Excel Blob specifically for Inward Report export (local or Google Drive Inward folder)
+  buildInwardReportExcelBlob(
+    movements: StockMovement[],
+    parts: Part[],
+    vendorInvoices: VendorInvoice[] = [],
+    monthFilter?: string
+  ): { blob: Blob; fileName: string } {
+    const wb = XLSX.utils.book_new();
+    const inwardMovements = movements.filter(
+      (m) => m.type === 'IN' && (!monthFilter || m.timestamp.startsWith(monthFilter))
+    );
+
+    const ledgerRows = inwardMovements.map((m, idx) => ({
+      'Sl. No.': idx + 1,
+      'Date': m.timestamp.slice(0, 10),
+      'Part Number': m.partNumber,
+      'Category': m.category,
+      'Inward Qty': m.quantity,
+      'Unit Price (₹ INR)': Number(m.unitPrice.toFixed(4)),
+      'Total Inward Value (₹ INR)': Number(m.totalMovementValue.toFixed(2)),
+      'Storage Location': m.location,
+      'Received From / Supplier': m.personName,
+      'Reference / Notes': m.notes,
+    }));
+    const wsLedger = XLSX.utils.json_to_sheet(
+      ledgerRows.length > 0
+        ? ledgerRows
+        : [{ 'Sl. No.': '-', 'Date': '-', 'Part Number': 'No inward entries found' }]
+    );
+    XLSX.utils.book_append_sheet(wb, wsLedger, 'Inward Ledger');
+
+    // Monthly Inward Summary
+    const monthMap = new Map<string, { count: number; qty: number; val: number }>();
+    for (const m of inwardMovements) {
+      const mk = m.timestamp.slice(0, 7);
+      const cur = monthMap.get(mk) || { count: 0, qty: 0, val: 0 };
+      cur.count += 1;
+      cur.qty += m.quantity;
+      cur.val += m.totalMovementValue;
+      monthMap.set(mk, cur);
+    }
+    const monthlyRows = Array.from(monthMap.entries())
+      .sort(([a], [b]) => b.localeCompare(a))
+      .map(([monthKey, d]) => ({
+        'Month': monthKey,
+        'Inward Transactions': d.count,
+        'Total Inward Units': d.qty,
+        'Total Inward Value (₹ INR)': Number(d.val.toFixed(2)),
+      }));
+    const wsMonthly = XLSX.utils.json_to_sheet(
+      monthlyRows.length > 0 ? monthlyRows : [{ Month: '-', 'Inward Transactions': 0 }]
+    );
+    XLSX.utils.book_append_sheet(wb, wsMonthly, 'Monthly Inward Summary');
+
+    // Supplier Invoices Summary
+    if (vendorInvoices.length > 0) {
+      const invRows = vendorInvoices.map((inv, idx) => ({
+        'Sl. No.': idx + 1,
+        'Supplier': inv.supplier,
+        'Invoice Number': inv.invoiceNumber,
+        'Invoice Date': inv.invoiceDate,
+        'PO Number': inv.purchaseOrder || '-',
+        'Total Units': inv.totalItemsCount,
+        'Total Amount (₹ INR)': Number(inv.totalAmount.toFixed(2)),
+        'Status': inv.status.toUpperCase(),
+      }));
+      const wsInv = XLSX.utils.json_to_sheet(invRows);
+      XLSX.utils.book_append_sheet(wb, wsInv, 'Supplier Invoices');
+    }
+
+    // Current Stock Valuation Snapshot
+    const stockRows = parts.map((p, idx) => ({
+      'Sl. No.': idx + 1,
+      'Part Number': p.partNumber,
+      'Category': p.category,
+      'Supplier': p.supplier,
+      'Location': p.location,
+      'Total Inward': p.totalInward,
+      'Available Stock': p.availableStock,
+      'Avg Unit Price (₹ INR)': Number(p.avgUnitPrice.toFixed(4)),
+      'Stock Value (₹ INR)': Number(p.totalValue.toFixed(2)),
+    }));
+    const wsStock = XLSX.utils.json_to_sheet(stockRows);
+    XLSX.utils.book_append_sheet(wb, wsStock, 'Current Stock Snapshot');
+
+    const wbArray = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+    const blob = new Blob([wbArray], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
+    const suffix = monthFilter || new Date().toISOString().slice(0, 10);
+    return {
+      blob,
+      fileName: `Elentory_Inward_Report_${suffix}.xlsx`,
+    };
   },
 };

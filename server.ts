@@ -2,13 +2,14 @@ import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import {
   INITIAL_PARTS,
   INITIAL_MOVEMENTS,
   INITIAL_PROJECTS,
   INITIAL_VENDOR_INVOICES,
   INITIAL_INSPECTION_REPORTS,
+  INITIAL_APPROVED_VENDORS,
   generateLocations,
 } from './src/data/seedData.ts';
 import {
@@ -20,6 +21,7 @@ import {
   ComponentCategory,
   VendorInvoice,
   SupplierInspectionReport,
+  ApprovedVendor,
 } from './src/types/inventory.ts';
 
 dotenv.config();
@@ -39,13 +41,78 @@ let movementsDatabase: StockMovement[] = JSON.parse(JSON.stringify(INITIAL_MOVEM
 let projectsDatabase: ProjectBOM[] = JSON.parse(JSON.stringify(INITIAL_PROJECTS));
 let vendorInvoicesDatabase: VendorInvoice[] = JSON.parse(JSON.stringify(INITIAL_VENDOR_INVOICES));
 let inspectionReportsDatabase: SupplierInspectionReport[] = JSON.parse(JSON.stringify(INITIAL_INSPECTION_REPORTS));
+let approvedVendorsDatabase: ApprovedVendor[] = JSON.parse(JSON.stringify(INITIAL_APPROVED_VENDORS));
 const locationsDatabase: StorageLocation[] = generateLocations();
 
-// Initialize Google Gen AI client if key is available
-const apiKey = process.env.GEMINI_API_KEY;
-let aiClient: GoogleGenAI | null = null;
-if (apiKey) {
-  aiClient = new GoogleGenAI({ apiKey });
+// Initialize Google Gen AI client with required User-Agent header
+const GEMINI_MODEL = 'gemini-4-hydrogen';
+
+function getAiClient(): GoogleGenAI | null {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return null;
+  return new GoogleGenAI({
+    apiKey: key,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+const aiClient: GoogleGenAI | null = getAiClient();
+
+async function callGeminiWithRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+  let lastError: any;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      const status = err?.status || err?.code;
+      const msg = String(err?.message || '');
+      const isRetryable =
+        status === 429 ||
+        status === 503 ||
+        status === 500 ||
+        msg.includes('429') ||
+        msg.includes('503') ||
+        msg.includes('UNAVAILABLE') ||
+        msg.includes('RESOURCE_EXHAUSTED');
+      if (!isRetryable || attempt === maxRetries) {
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 600 * Math.pow(2, attempt)));
+    }
+  }
+  throw lastError;
+}
+
+function getGeminiHttpError(err: any, fallbackMsg: string): { status: number; message: string } {
+  const msg = String(err?.message || fallbackMsg);
+  const rawStatus = Number(err?.status || err?.code);
+  if (rawStatus === 403 || msg.includes('PERMISSION_DENIED') || msg.includes('API_KEY_INVALID')) {
+    return {
+      status: 403,
+      message: 'Gemini API authentication failed. Please verify your API key in Settings > Secrets.',
+    };
+  }
+  if (rawStatus === 429 || msg.includes('RESOURCE_EXHAUSTED')) {
+    return {
+      status: 429,
+      message: 'AI rate limit reached. Please wait a moment and try again, or check your API quota in Settings > Secrets.',
+    };
+  }
+  if (rawStatus === 404 || msg.includes('NOT_FOUND')) {
+    return {
+      status: 502,
+      message: `AI model unavailable (${GEMINI_MODEL}). ${msg}`,
+    };
+  }
+  return {
+    status: rawStatus >= 400 && rawStatus < 600 ? rawStatus : 500,
+    message: msg || fallbackMsg,
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -61,6 +128,7 @@ app.get('/api/inventory', (_req, res) => {
     locations: locationsDatabase,
     vendorInvoices: vendorInvoicesDatabase,
     inspectionReports: inspectionReportsDatabase,
+    approvedVendors: approvedVendorsDatabase,
   });
 });
 
@@ -647,73 +715,76 @@ app.post('/api/scan-outward', async (req, res) => {
       return res.status(400).json({ error: 'Image base64 data is required' });
     }
 
-    const cleanBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
-    let scannedItems: { partNumber: string; quantity: number; notes?: string }[] = [];
-    let scanMode: 'reel' | 'work_order' = 'reel';
-    let workOrderNumber = '';
-    let rawOcrText = '';
+    const client = aiClient || getAiClient();
+    if (!client) {
+      return res.status(503).json({
+        error: 'Gemini API key is not configured. Please check Settings > Secrets.',
+      });
+    }
 
-    if (aiClient) {
-      try {
-        const prompt = `You are an expert electronics warehouse technician inspecting stock dispatches.
+    const cleanBase64 = imageBase64.replace(/^data:[^;]+;base64,/, '');
+    const prompt = `You are an expert electronics warehouse technician inspecting stock dispatches.
 Analyze this photo which may be either:
-1. An electronics component reel/bag label (e.g. DigiKey, Mouser, Yageo, Vishay label)
+1. An electronics component reel/bag label
 2. A printed workshop work order, pick list, or BOM requisition sheet containing one or more part numbers and required quantities.
 
-Identify whether this is a single reel/bag or a multi-part work order/pick list.
-Extract all requested electronic components and their requested dispatch quantities in strict JSON:
-{
-  "scanMode": "reel" | "work_order",
-  "workOrderNumber": "e.g. WO-2026-94 if visible or empty string",
-  "items": [
-    {
-      "partNumber": "exact manufacturer or distributor part number",
-      "quantity": numeric quantity (integer, default 100 if single reel or unclear),
-      "notes": "brief item description, value, or designator if visible"
-    }
-  ],
-  "rawOcrText": "concise raw text read directly from the photo"
-}
-Output ONLY the raw JSON object, without markdown formatting or code blocks.`;
+Extract ONLY the actual part numbers and requested quantities visibly shown in this image. Do NOT invent items.`;
 
-        const response = await aiClient.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: [
+    const response = await callGeminiWithRetry(() =>
+      client.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: {
+          parts: [
             {
-              role: 'user',
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: mimeType || 'image/jpeg',
-                    data: cleanBase64,
-                  },
-                },
-                { text: prompt },
-              ],
+              inlineData: {
+                mimeType: mimeType || 'image/jpeg',
+                data: cleanBase64,
+              },
             },
+            { text: prompt },
           ],
-        });
+        },
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              scanMode: { type: Type.STRING, description: 'Either "reel" or "work_order"' },
+              workOrderNumber: { type: Type.STRING, description: 'Work order number if visible, else empty string' },
+              items: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    partNumber: { type: Type.STRING, description: 'Exact manufacturer or distributor part number' },
+                    quantity: { type: Type.INTEGER, description: 'Requested quantity (default 1 if unclear)' },
+                    notes: { type: Type.STRING, description: 'Brief item description, value, or designator if visible' },
+                  },
+                  required: ['partNumber', 'quantity'],
+                },
+              },
+              rawOcrText: { type: Type.STRING, description: 'Concise raw text read directly from the image' },
+            },
+            required: ['scanMode', 'items', 'rawOcrText'],
+          },
+        },
+      })
+    );
 
-        const raw = response.text || '';
-        rawOcrText = raw;
-        const match = raw.match(/\{[\s\S]*\}/);
-        if (match) {
-          const parsed = JSON.parse(match[0]);
-          scanMode = parsed.scanMode || 'reel';
-          workOrderNumber = parsed.workOrderNumber || '';
-          scannedItems = parsed.items || [];
-          rawOcrText = parsed.rawOcrText || raw;
-        }
-      } catch (err: any) {
-        console.warn('Gemini outward scan error, using heuristic fallback:', err);
-      }
-    }
+    const raw = (response.text || '').trim();
+    const parsed = JSON.parse(raw);
+    const scanMode: 'reel' | 'work_order' = parsed.scanMode === 'work_order' ? 'work_order' : 'reel';
+    const workOrderNumber: string = parsed.workOrderNumber || '';
+    const scannedItems: { partNumber: string; quantity: number; notes?: string }[] = Array.isArray(parsed.items)
+      ? parsed.items
+      : [];
+    const rawOcrText: string = parsed.rawOcrText || raw;
 
     if (scannedItems.length === 0) {
-      scannedItems = [
-        { partNumber: 'CRCW06031K00FKEA', quantity: 200, notes: '1k 0603 precision resistor' },
-      ];
-      rawOcrText = 'WORK ORDER #WO-8821 | PART: CRCW06031K00FKEA | REQ QTY: 200';
+      return res.status(422).json({
+        error: 'No part numbers or pick-list items could be detected in the uploaded image.',
+      });
     }
 
     // Automatically check and control warehouse stock for every extracted item
@@ -756,7 +827,9 @@ Output ONLY the raw JSON object, without markdown formatting or code blocks.`;
       },
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Outward AI scan failed' });
+    console.error('Gemini outward scan error:', error);
+    const mapped = getGeminiHttpError(error, 'Outward AI scan failed');
+    res.status(mapped.status).json({ error: mapped.message });
   }
 });
 
@@ -769,136 +842,78 @@ app.post('/api/scan-label', async (req, res) => {
       return res.status(400).json({ error: 'Image base64 data is required' });
     }
 
-    // Strip data URL header if present
-    const cleanBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+    const client = aiClient || getAiClient();
+    if (!client) {
+      return res.status(503).json({
+        error: 'Gemini API key is not configured. Please check Settings > Secrets.',
+      });
+    }
 
-    if (aiClient) {
-      try {
-        const prompt = `You are an expert electronics warehouse technician and optical inspection system.
-Analyze this photo of an electronics component reel, bag, label, or distributor sticker (e.g. DigiKey, Mouser, LCSC, Yageo, Vishay, Murata, TDK, Samsung, local vendor).
-Extract and identify the following fields in strict JSON format:
-{
-  "partNumber": "exact manufacturer or distributor part number",
-  "category": "Resistor" | "Capacitor" | "Inductor" | "Diode" | "Enclosure" | "IC" | "Connector",
-  "makeBrand": "Manufacturer name like Yageo, Murata, Vishay, TDK, etc.",
-  "supplier": "Distributor or supplier if visible (DigiKey, Mouser, LCSC, Local Vendor, etc.)",
-  "quantity": numeric quantity (integer, e.g. 1000, 5000, 50, etc., default 1000 if reel or unclear),
-  "unitPrice": estimated or parsed unit price in Indian Rupees (₹ / INR, e.g. 0.35 for standard SMD chip, 1.20 for power inductor, 4.50 for enclosure, or default 0.50 INR),
-  "technicalSpecs": {
-    "value": "electrical value e.g. 10kΩ, 100nF, 10µH, 0.7V Vf",
-    "tolerance": "e.g. ±1%, ±5%, ±10%",
-    "packageFootprint": "e.g. 0402, 0603, 0805, 1206, SOD-123, SMA, Through-Hole",
-    "powerOrVoltageRating": "e.g. 1/8W, 50V, 25V, 1A",
-    "dielectricOrType": "e.g. X7R, C0G, Thick Film, Schottky Barrier, Fast Switching"
-  },
-  "suggestedLocation": "STR1S1B1 to STR3S4B4 grid or open shelf STR1S1",
-  "rawOcrText": "concise raw text read directly off the label",
-  "confidence": "high" | "medium" | "low"
-}
-Output ONLY the raw JSON object, without backticks or markdown formatting.`;
+    const cleanBase64 = imageBase64.replace(/^data:[^;]+;base64,/, '');
+    const prompt = `You are an expert electronics warehouse technician and optical inspection system.
+Analyze this photo of an electronics component reel, bag, label, or distributor sticker${fileName ? ` (filename: ${fileName})` : ''}.
+Extract ONLY the actual part number, manufacturer, distributor/supplier, quantity, electrical specifications, and raw text visibly printed on this label.
+If a unit price is printed on the label, extract it in Indian Rupees (INR); otherwise estimate a realistic INR unit price or return 0.
+Allowed categories: "Resistor", "Capacitor", "Inductor", "Diode", "Enclosure", "IC", "Connector", "Mechanical".
+Suggest a bin location between STR1S1B1 and STR3S4B4.`;
 
-        const response = await aiClient.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: [
+    const response = await callGeminiWithRetry(() =>
+      client.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: {
+          parts: [
             {
-              role: 'user',
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: mimeType || 'image/jpeg',
-                    data: cleanBase64,
-                  },
-                },
-                {
-                  text: prompt,
-                },
-              ],
+              inlineData: {
+                mimeType: mimeType || 'image/jpeg',
+                data: cleanBase64,
+              },
             },
+            { text: prompt },
           ],
-        });
+        },
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              partNumber: { type: Type.STRING, description: 'Exact manufacturer or distributor part number' },
+              category: { type: Type.STRING, description: 'Component category' },
+              makeBrand: { type: Type.STRING, description: 'Manufacturer brand name' },
+              supplier: { type: Type.STRING, description: 'Distributor or supplier name if visible' },
+              quantity: { type: Type.INTEGER, description: 'Quantity on label (default 1 if unclear)' },
+              unitPrice: { type: Type.NUMBER, description: 'Unit price in Indian Rupees (INR)' },
+              technicalSpecs: {
+                type: Type.OBJECT,
+                properties: {
+                  value: { type: Type.STRING },
+                  tolerance: { type: Type.STRING },
+                  packageFootprint: { type: Type.STRING },
+                  powerOrVoltageRating: { type: Type.STRING },
+                  dielectricOrType: { type: Type.STRING },
+                },
+              },
+              suggestedLocation: { type: Type.STRING, description: 'Warehouse bin location e.g. STR1S1B1' },
+              rawOcrText: { type: Type.STRING, description: 'Concise raw text read directly from the label' },
+              confidence: { type: Type.STRING, description: 'high, medium, or low' },
+            },
+            required: ['partNumber', 'category', 'quantity', 'rawOcrText', 'confidence'],
+          },
+        },
+      })
+    );
 
-        const rawText = response.text || '';
-        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          return res.json({
-            success: true,
-            source: 'gemini-multimodal',
-            data: parsed,
-          });
-        }
-      } catch (geminiError: any) {
-        console.error('Gemini vision API error, falling back:', geminiError);
-      }
-    }
-
-    // High-fidelity fallback / simulated intelligent parser if API key is not configured or rate-limited
-    // Derives varied realistic parts based on fileName so multiple uploaded images don't overwrite each other
-    const cleanFileTag = fileName ? fileName.replace(/\.[^/.]+$/, '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase() : '';
-    const fallbackPartsPool = [
-      {
-        partNumber: cleanFileTag ? `RC0805-${cleanFileTag.slice(-6)}` : 'RC0805FR-0710KL',
-        category: 'Resistor' as ComponentCategory,
-        makeBrand: 'Yageo',
-        supplier: 'DigiKey',
-        quantity: 1000,
-        unitPrice: 0.35,
-        technicalSpecs: { value: '10kΩ', tolerance: '±1%', packageFootprint: '0805', powerOrVoltageRating: '1/8W', dielectricOrType: 'Thick Film' },
-        suggestedLocation: 'STR1S1B1',
-        rawOcrText: `YAGEO RES SMD 10K 1% 0805 | ${fileName || 'REEL-01'}`,
-      },
-      {
-        partNumber: cleanFileTag ? `CL21B-${cleanFileTag.slice(-6)}` : 'CL21B104KBCNNNC',
-        category: 'Capacitor' as ComponentCategory,
-        makeBrand: 'Samsung',
-        supplier: 'Mouser',
-        quantity: 2000,
-        unitPrice: 0.55,
-        technicalSpecs: { value: '100nF', tolerance: '±10%', packageFootprint: '0805', powerOrVoltageRating: '50V', dielectricOrType: 'X7R' },
-        suggestedLocation: 'STR1S2B1',
-        rawOcrText: `SAMSUNG MLCC 100NF 50V 0805 | ${fileName || 'REEL-02'}`,
-      },
-      {
-        partNumber: cleanFileTag ? `VLS3012-${cleanFileTag.slice(-6)}` : 'VLS3012ET-100M',
-        category: 'Inductor' as ComponentCategory,
-        makeBrand: 'TDK',
-        supplier: 'DigiKey',
-        quantity: 500,
-        unitPrice: 3.50,
-        technicalSpecs: { value: '10µH', tolerance: '±20%', packageFootprint: '0805 (3012)', powerOrVoltageRating: '0.7A', dielectricOrType: 'Shielded Ferrite' },
-        suggestedLocation: 'STR2S1B1',
-        rawOcrText: `TDK POWER INDUCTOR 10UH SMD | ${fileName || 'REEL-03'}`,
-      },
-      {
-        partNumber: cleanFileTag ? `1N4148-${cleanFileTag.slice(-6)}` : '1N4148W-7-F',
-        category: 'Diode' as ComponentCategory,
-        makeBrand: 'Diodes Inc',
-        supplier: 'LCSC',
-        quantity: 3000,
-        unitPrice: 0.45,
-        technicalSpecs: { value: '100V 300mA', tolerance: 'N/A', packageFootprint: 'SOD-123', powerOrVoltageRating: '400mW', dielectricOrType: 'Fast Switching' },
-        suggestedLocation: 'STR1S4B1',
-        rawOcrText: `DIODES INC 1N4148W SOD-123 | ${fileName || 'REEL-04'}`,
-      },
-    ];
-
-    // Pick a deterministic item based on fileName character hash
-    let hash = 0;
-    for (let c = 0; c < (fileName || 'part').length; c++) {
-      hash = (hash + (fileName || 'part').charCodeAt(c)) % fallbackPartsPool.length;
-    }
-    const simulatedResult: AIScanResult = {
-      ...fallbackPartsPool[hash],
-      confidence: 'medium',
-    };
-
+    const rawText = (response.text || '').trim();
+    const parsed: AIScanResult = JSON.parse(rawText);
     return res.json({
       success: true,
-      source: 'offline-ocr-engine',
-      data: simulatedResult,
+      source: 'gemini-multimodal',
+      data: parsed,
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Vision scan failed' });
+    console.error('Gemini label scan error:', error);
+    const mapped = getGeminiHttpError(error, 'Vision label scan failed');
+    res.status(mapped.status).json({ error: mapped.message });
   }
 });
 
@@ -949,7 +964,96 @@ app.post('/api/reset', (_req, res) => {
   projectsDatabase = JSON.parse(JSON.stringify(INITIAL_PROJECTS));
   vendorInvoicesDatabase = JSON.parse(JSON.stringify(INITIAL_VENDOR_INVOICES));
   inspectionReportsDatabase = JSON.parse(JSON.stringify(INITIAL_INSPECTION_REPORTS));
+  approvedVendorsDatabase = JSON.parse(JSON.stringify(INITIAL_APPROVED_VENDORS));
   res.json({ success: true, message: 'Database reset to default test lab dataset' });
+});
+
+// -----------------------------------------------------------------------------
+// 9A. APPROVED VENDORS DIRECTORY & REGISTRATION CRUD
+// -----------------------------------------------------------------------------
+
+app.get('/api/vendors', (_req, res) => {
+  res.json({ vendors: approvedVendorsDatabase });
+});
+
+app.post('/api/vendors', (req, res) => {
+  try {
+    const payload = req.body as Partial<ApprovedVendor>;
+    if (!payload.name || !String(payload.name).trim()) {
+      return res.status(400).json({ error: 'Vendor name is required.' });
+    }
+
+    const now = new Date().toISOString();
+    const id = payload.id || `vnd-${Date.now()}`;
+    const existingIdx = approvedVendorsDatabase.findIndex((v) => v.id === id);
+
+    const nextVendor: ApprovedVendor = {
+      id,
+      vendorCode:
+        payload.vendorCode?.trim() ||
+        `VND-${String(approvedVendorsDatabase.length + 1).padStart(3, '0')}`,
+      name: String(payload.name).trim(),
+      address: String(payload.address || '').trim(),
+      contactPerson: String(payload.contactPerson || '').trim(),
+      contactDesignation: String(payload.contactDesignation || '').trim(),
+      phone: String(payload.phone || '').trim(),
+      email: String(payload.email || '').trim(),
+      website: String(payload.website || '').trim(),
+      whatSupplierFor: String(payload.whatSupplierFor || '').trim(),
+      suppliedCategories: Array.isArray(payload.suppliedCategories) ? payload.suppliedCategories : [],
+      gstin: String(payload.gstin || '').trim().toUpperCase(),
+      pan: String(payload.pan || '').trim().toUpperCase(),
+      bankName: String(payload.bankName || '').trim(),
+      accountNumber: String(payload.accountNumber || '').trim(),
+      ifscCode: String(payload.ifscCode || '').trim().toUpperCase(),
+      msmeNumber: String(payload.msmeNumber || '').trim().toUpperCase(),
+      isoLicenseNo: String(payload.isoLicenseNo || '').trim(),
+      status: payload.status || 'approved',
+      approvedDate: payload.approvedDate || now.slice(0, 10),
+      notes: String(payload.notes || '').trim(),
+      documents: Array.isArray(payload.documents) ? payload.documents : [],
+      createdAt: payload.createdAt || now,
+    };
+
+    if (existingIdx >= 0) {
+      approvedVendorsDatabase[existingIdx] = nextVendor;
+    } else {
+      approvedVendorsDatabase.push(nextVendor);
+    }
+
+    res.json({ success: true, vendor: nextVendor });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to save vendor' });
+  }
+});
+
+app.put('/api/vendors/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const idx = approvedVendorsDatabase.findIndex((v) => v.id === id);
+    if (idx === -1) {
+      return res.status(404).json({ error: 'Vendor not found' });
+    }
+    const updated: ApprovedVendor = {
+      ...approvedVendorsDatabase[idx],
+      ...req.body,
+      id,
+    };
+    approvedVendorsDatabase[idx] = updated;
+    res.json({ success: true, vendor: updated });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to update vendor' });
+  }
+});
+
+app.delete('/api/vendors/:id', (req, res) => {
+  const { id } = req.params;
+  const before = approvedVendorsDatabase.length;
+  approvedVendorsDatabase = approvedVendorsDatabase.filter((v) => v.id !== id);
+  if (approvedVendorsDatabase.length === before) {
+    return res.status(404).json({ error: 'Vendor not found' });
+  }
+  res.json({ success: true });
 });
 
 // -----------------------------------------------------------------------------
@@ -1001,142 +1105,185 @@ app.delete('/api/vendor/invoices/:id', (req, res) => {
   res.json({ success: true, message: 'Vendor invoice deleted' });
 });
 
-// Multimodal AI Scan for Supplier Invoices (PDF, PNG, JPG, JPEG)
+// Multimodal AI Scan for Supplier Invoices (PDF, PNG, JPG, JPEG, WEBP, CSV, TXT)
 app.post('/api/vendor/invoices/scan', async (req, res) => {
   try {
     const { imageBase64, mimeType, fileName } = req.body;
     if (!imageBase64) {
-      return res.status(400).json({ error: 'imageBase64 payload is required' });
+      return res.status(400).json({ error: 'Document payload (imageBase64) is required' });
     }
 
+    const client = aiClient || getAiClient();
+    if (!client) {
+      return res.status(503).json({
+        error: 'Gemini API key is not configured. Please check Settings > Secrets.',
+      });
+    }
+
+    const dataUriMatch = /^data:([^;]+);base64,/.exec(imageBase64);
     const cleanBase64 = imageBase64.replace(/^data:[^;]+;base64,/, '');
-    const docMimeType = mimeType || (fileName?.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'image/jpeg');
+    const lowerName = (fileName || '').toLowerCase();
 
-    let extractedData: any = null;
-
-    if (aiClient) {
-      try {
-        const prompt = `You are an expert procurement and logistics specialist inspecting supplier invoices and delivery challans for electronics manufacturing.
-Examine this invoice/document (which may be a photo, scan, or PDF) and extract all supplier, transaction, and item details.
-Return a STRICT JSON object in this format:
-{
-  "supplier": "Name of the supplier / vendor company (e.g. Mudra Innovation, DigiKey, Mouser)",
-  "supplierGstin": "GSTIN / Tax ID of supplier if present (e.g. 29ABHFM7009H1Z2) or empty string",
-  "customer": "Customer company name (e.g. SENSEL TELEMATICS PVT LTD) or empty string",
-  "invoiceNumber": "Invoice or delivery challan number (e.g. INV-KT/25-26/839)",
-  "invoiceDate": "YYYY-MM-DD or date string as written (e.g. 2026-03-24)",
-  "purchaseOrder": "Purchase Order / PO number (e.g. STPL-PO-2025-26-S171) or empty string",
-  "ewayBill": "E-Way bill number if present (e.g. 122380664709) or empty string",
-  "items": [
-    {
-      "slNo": 1,
-      "partNumber": "Part number or SKU (e.g. ENC-ABS-ASG-GOLD, or generate a clean part number from description)",
-      "description": "Item description (e.g. ABS Enclosures (ASG Gold Enclosures))",
-      "hsn": "HSN/SAC code (e.g. 39269099) or empty string",
-      "quantity": numeric total quantity integer (e.g. 590),
-      "unitPrice": numeric unit price (float/integer) or 0 if not indicated,
-      "category": "Enclosure" | "Resistor" | "Capacitor" | "Inductor" | "Diode" | "Mechanical" | "IC" | "Connector",
-      "location": "STR1S3B1"
+    let docMimeType = (mimeType || dataUriMatch?.[1] || '').toLowerCase();
+    if (!docMimeType || docMimeType === 'application/octet-stream') {
+      if (lowerName.endsWith('.pdf')) docMimeType = 'application/pdf';
+      else if (lowerName.endsWith('.png')) docMimeType = 'image/png';
+      else if (lowerName.endsWith('.webp')) docMimeType = 'image/webp';
+      else if (lowerName.endsWith('.csv')) docMimeType = 'text/csv';
+      else if (lowerName.endsWith('.txt')) docMimeType = 'text/plain';
+      else docMimeType = 'image/jpeg';
     }
-  ],
-  "totalAmount": numeric total invoice amount if present,
-  "notes": "Any other key details, batch numbers, or terms"
-}
-Output ONLY raw JSON.`;
 
-        const response = await aiClient.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: docMimeType,
-                    data: cleanBase64,
+    const isTextDocument =
+      docMimeType.startsWith('text/') ||
+      docMimeType === 'application/csv' ||
+      lowerName.endsWith('.csv') ||
+      lowerName.endsWith('.txt');
+
+    const prompt = `You are an expert procurement and accounts specialist extracting data from supplier tax invoices, commercial invoices, and delivery challans for electronics manufacturing.
+Carefully read EVERY detail visibly present in THIS uploaded document${fileName ? ` (filename: ${fileName})` : ''}.
+STRICT RULES:
+1. Extract ONLY the actual supplier/seller name, GSTIN/tax ID, buyer/customer name, invoice/challan number, invoice date, PO number, E-Way bill number, and EVERY line item printed in THIS document.
+2. NEVER invent, guess, or substitute sample or unrelated company names. If a field is not present on the document, return an empty string "" (or 0 for numbers).
+3. Distinguish clearly between the Seller/Supplier (issuer of the invoice) and the Buyer/Customer (Consignee / Bill To). Put the seller company name in "supplier" and the buyer company name in "customer".
+4. Extract ALL line items in the invoice table with exact descriptions, HSN/SAC codes, quantities, unit rates (in the invoice's native currency — e.g. Indian Rupees INR without converting to USD), and line totals.
+5. For "partNumber", use the exact SKU/MPN/Item Code printed on the invoice; if the invoice has no SKU column, derive a concise uppercase code from the item description.
+6. Choose the closest category from: "Enclosure", "Resistor", "Capacitor", "Inductor", "Diode", "Mechanical", "IC", "Connector".`;
+
+    const requestParts: any[] = [];
+    if (isTextDocument) {
+      const decodedText = Buffer.from(cleanBase64, 'base64').toString('utf-8');
+      requestParts.push({
+        text: `${prompt}\n\n--- UPLOADED DOCUMENT CONTENT ---\n${decodedText.slice(0, 100000)}`,
+      });
+    } else {
+      requestParts.push({
+        inlineData: {
+          mimeType: docMimeType,
+          data: cleanBase64,
+        },
+      });
+      requestParts.push({ text: prompt });
+    }
+
+    const response = await callGeminiWithRetry(() =>
+      client.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: { parts: requestParts },
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              supplier: { type: Type.STRING, description: 'Exact seller / supplier company name printed on the invoice' },
+              supplierGstin: { type: Type.STRING, description: 'Supplier GSTIN / Tax ID if present, else empty string' },
+              customer: { type: Type.STRING, description: 'Buyer / Bill To / Consignee company name if present, else empty string' },
+              invoiceNumber: { type: Type.STRING, description: 'Invoice or Delivery Challan number' },
+              invoiceDate: { type: Type.STRING, description: 'Invoice date in YYYY-MM-DD format if parseable, else as printed' },
+              purchaseOrder: { type: Type.STRING, description: 'Buyer PO / Order number if present, else empty string' },
+              ewayBill: { type: Type.STRING, description: 'E-Way Bill number if present, else empty string' },
+              items: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    slNo: { type: Type.INTEGER, description: 'Line serial number' },
+                    partNumber: { type: Type.STRING, description: 'Item SKU / part number from invoice or concise derived code' },
+                    description: { type: Type.STRING, description: 'Full item description from invoice' },
+                    hsn: { type: Type.STRING, description: 'HSN / SAC code if present, else empty string' },
+                    quantity: { type: Type.NUMBER, description: 'Exact billed quantity' },
+                    unitPrice: { type: Type.NUMBER, description: 'Unit rate / price per unit as printed (numeric, 0 if omitted)' },
+                    totalPrice: { type: Type.NUMBER, description: 'Line item taxable amount / total as printed (numeric, 0 if omitted)' },
+                    category: { type: Type.STRING, description: 'Component category' },
+                    location: { type: Type.STRING, description: 'Suggested warehouse bin e.g. STR1S1B1' },
+                    notes: { type: Type.STRING, description: 'Optional line notes, batch/lot, or unit of measure' },
                   },
+                  required: ['description', 'quantity'],
                 },
-                { text: prompt },
-              ],
+              },
+              totalAmount: { type: Type.NUMBER, description: 'Grand total or subtotal invoice value as printed' },
+              notes: { type: Type.STRING, description: 'Additional invoice notes, tax summary (CGST/SGST/IGST), or payment terms' },
             },
-          ],
-        });
-
-        const raw = response.text || '';
-        const match = raw.match(/\{[\s\S]*\}/);
-        if (match) {
-          extractedData = JSON.parse(match[0]);
-        }
-      } catch (geminiErr: any) {
-        console.warn('Gemini Invoice scan fallback:', geminiErr?.message);
-      }
-    }
-
-    // Heuristic / Intelligent Fallback if Gemini returned null or offline
-    if (!extractedData) {
-      extractedData = {
-        supplier: 'Mudra Innovation',
-        supplierGstin: '29ABHFM7009H1Z2',
-        customer: 'SENSEL TELEMATICS PVT LTD',
-        invoiceNumber: `INV-KT/25-26/${Math.floor(800 + Math.random() * 100)}`,
-        invoiceDate: new Date().toISOString().split('T')[0],
-        purchaseOrder: 'STPL-PO-2025-26-S171',
-        ewayBill: '122380664709',
-        items: [
-          {
-            id: 'vitem-001',
-            slNo: 1,
-            partNumber: 'ENC-ABS-ASG-GOLD',
-            description: 'ABS Enclosures (ASG Gold Enclosures)',
-            hsn: '39269099',
-            quantity: 590,
-            unitPrice: 4.5,
-            totalPrice: 2655,
-            category: 'Enclosure',
-            location: 'STR1S3B1',
-            notes: 'High quality injection moulded enclosure batch',
-            isNewSku: true,
+            required: ['supplier', 'invoiceNumber', 'items'],
           },
-        ],
-        totalAmount: 2655,
-        notes: 'Scanned from supplier manifest delivery challan',
-      };
+        },
+      })
+    );
+
+    const raw = (response.text || '').trim();
+    if (!raw) {
+      return res.status(502).json({ error: 'AI returned an empty response for this document. Please try a clearer image or PDF.' });
     }
 
-    // Format items with IDs
-    const items = (extractedData.items || []).map((it: any, idx: number) => ({
-      id: `vitem-${Date.now()}-${idx}`,
-      slNo: it.slNo || idx + 1,
-      partNumber: String(it.partNumber || `SKU-${Date.now()}-${idx}`).trim().toUpperCase(),
-      description: it.description || 'Supplied Component',
-      hsn: it.hsn || '85423900',
-      quantity: Number(it.quantity) || 100,
-      unitPrice: Number(it.unitPrice) || 1.0,
-      totalPrice: Number(((Number(it.quantity) || 100) * (Number(it.unitPrice) || 1.0)).toFixed(2)),
-      category: (it.category as ComponentCategory) || 'Enclosure',
-      location: it.location || 'STR1S1B1',
-      notes: it.notes || '',
-      isNewSku: !partsDatabase.some((p) => p.partNumber === String(it.partNumber).trim().toUpperCase()),
-    }));
+    const extractedData = JSON.parse(raw);
 
+    const rawItems = Array.isArray(extractedData.items) ? extractedData.items : [];
+    const items = rawItems.map((it: any, idx: number) => {
+      const qty = Number(it.quantity) > 0 ? Number(it.quantity) : 1;
+      let unitPrice = Number(it.unitPrice);
+      let lineTotal = Number(it.totalPrice);
+
+      if (!Number.isFinite(unitPrice) || unitPrice < 0) unitPrice = 0;
+      if (!Number.isFinite(lineTotal) || lineTotal < 0) lineTotal = 0;
+
+      if (unitPrice === 0 && lineTotal > 0 && qty > 0) {
+        unitPrice = Number((lineTotal / qty).toFixed(4));
+      } else if (lineTotal === 0 && unitPrice > 0) {
+        lineTotal = Number((qty * unitPrice).toFixed(2));
+      }
+
+      const rawPn = String(it.partNumber || '').trim();
+      const derivedPn =
+        rawPn ||
+        String(it.description || `ITEM-${idx + 1}`)
+          .replace(/[^a-zA-Z0-9]+/g, '-')
+          .replace(/^-|-$/g, '')
+          .toUpperCase()
+          .slice(0, 24) ||
+        `SKU-${Date.now().toString().slice(-4)}-${idx + 1}`;
+      const cleanPn = derivedPn.toUpperCase();
+
+      return {
+        id: `vitem-${Date.now()}-${idx}`,
+        slNo: Number(it.slNo) || idx + 1,
+        partNumber: cleanPn,
+        description: String(it.description || 'Supplied Item').trim(),
+        hsn: String(it.hsn || '').trim(),
+        quantity: qty,
+        unitPrice,
+        totalPrice: Number(lineTotal.toFixed(2)),
+        category: (it.category as ComponentCategory) || 'Mechanical',
+        location: String(it.location || 'STR1S1B1').trim() || 'STR1S1B1',
+        notes: String(it.notes || '').trim(),
+        isNewSku: !partsDatabase.some((p) => p.partNumber === cleanPn),
+      };
+    });
+
+    const sumOfLines = Number(items.reduce((acc: number, it: any) => acc + it.totalPrice, 0).toFixed(2));
+    const parsedGrandTotal = Number(extractedData.totalAmount);
+    const finalTotalAmount =
+      Number.isFinite(parsedGrandTotal) && parsedGrandTotal > 0 ? parsedGrandTotal : sumOfLines;
+
+    const cleanFileBase = (fileName || 'uploaded_invoice').replace(/\.[^/.]+$/, '');
     const invoice: VendorInvoice = {
       id: `vinv-${Date.now()}`,
-      supplier: extractedData.supplier || 'Mudra Innovation',
-      supplierGstin: extractedData.supplierGstin || '',
-      customer: extractedData.customer || 'SENSEL TELEMATICS PVT LTD',
-      invoiceNumber: extractedData.invoiceNumber || `INV-${Date.now().toString().slice(-6)}`,
-      invoiceDate: extractedData.invoiceDate || new Date().toISOString().split('T')[0],
-      purchaseOrder: extractedData.purchaseOrder || 'PO-STANDARD',
-      ewayBill: extractedData.ewayBill || '',
+      supplier: String(extractedData.supplier || '').trim() || `Supplier (${cleanFileBase})`,
+      supplierGstin: String(extractedData.supplierGstin || '').trim(),
+      customer: String(extractedData.customer || '').trim(),
+      invoiceNumber: String(extractedData.invoiceNumber || '').trim() || `INV-${Date.now().toString().slice(-6)}`,
+      invoiceDate: String(extractedData.invoiceDate || '').trim() || new Date().toISOString().split('T')[0],
+      purchaseOrder: String(extractedData.purchaseOrder || '').trim(),
+      ewayBill: String(extractedData.ewayBill || '').trim(),
       fileName: fileName || 'uploaded_invoice.pdf',
       fileType: docMimeType,
       fileData: imageBase64.startsWith('data:') ? imageBase64 : `data:${docMimeType};base64,${cleanBase64}`,
       items,
       status: 'uploaded',
       createdAt: new Date().toISOString(),
-      totalAmount: items.reduce((acc: number, it: any) => acc + it.totalPrice, 0),
+      totalAmount: finalTotalAmount,
       totalItemsCount: items.reduce((acc: number, it: any) => acc + it.quantity, 0),
-      notes: extractedData.notes || '',
+      notes: String(extractedData.notes || '').trim(),
     };
 
     // Store in database
@@ -1145,10 +1292,12 @@ Output ONLY raw JSON.`;
     res.json({
       success: true,
       invoice,
-      message: `Invoice ${invoice.invoiceNumber} scanned successfully (${items.length} items detected)`,
+      message: `Invoice ${invoice.invoiceNumber} from ${invoice.supplier} scanned (${items.length} line item${items.length === 1 ? '' : 's'} detected)`,
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to scan invoice' });
+    console.error('Vendor invoice scan error:', err);
+    const mapped = getGeminiHttpError(err, 'Failed to scan vendor invoice');
+    res.status(mapped.status).json({ error: mapped.message });
   }
 });
 
@@ -1476,10 +1625,71 @@ async function startServer() {
   const isProduction = process.env.NODE_ENV === 'production';
 
   if (!isProduction) {
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
+
+    if (hmrDisabled) {
+      app.use('/@vite/client', (req, res, next) => {
+        // Force Vite to return full body so we can strip WS connection cleanly
+        delete req.headers['if-none-match'];
+        delete req.headers['if-modified-since'];
+
+        const origEnd = res.end.bind(res);
+        const chunks: Buffer[] = [];
+        let ended = false;
+
+        res.write = ((chunk: any, encoding?: any, cb?: any) => {
+          if (chunk) {
+            chunks.push(
+              Buffer.isBuffer(chunk)
+                ? chunk
+                : Buffer.from(chunk, typeof encoding === 'string' ? (encoding as BufferEncoding) : undefined)
+            );
+          }
+          if (typeof encoding === 'function') encoding();
+          else if (typeof cb === 'function') cb();
+          return true;
+        }) as any;
+
+        res.end = ((chunk?: any, encoding?: any, cb?: any) => {
+          if (ended) return res;
+          ended = true;
+          if (chunk && typeof chunk !== 'function') {
+            chunks.push(
+              Buffer.isBuffer(chunk)
+                ? chunk
+                : Buffer.from(chunk, typeof encoding === 'string' ? (encoding as BufferEncoding) : undefined)
+            );
+          }
+          if (chunks.length > 0) {
+            let body = Buffer.concat(chunks).toString('utf-8');
+            if (body.includes('createWebSocketModuleRunnerTransport')) {
+              body = body.replace(
+                /const createWebSocketModuleRunnerTransport = \(options\) => \{/,
+                'const createWebSocketModuleRunnerTransport = (_options) => ({ async connect() {}, async disconnect() {}, send() {} }); const _disabledCreateWebSocketModuleRunnerTransport = (options) => {'
+              );
+              res.removeHeader('Content-Length');
+              res.removeHeader('ETag');
+              res.setHeader('Content-Length', Buffer.byteLength(body, 'utf-8'));
+              res.setHeader('Cache-Control', 'no-store');
+            }
+            const doneCb = typeof encoding === 'function' ? encoding : cb;
+            return origEnd(body, 'utf-8', doneCb);
+          }
+          return origEnd(chunk, encoding, cb);
+        }) as any;
+
+        next();
+      });
+    }
+
     // Mount Vite dev middlewares
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: !hmrDisabled,
+        ws: hmrDisabled ? false : undefined,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
